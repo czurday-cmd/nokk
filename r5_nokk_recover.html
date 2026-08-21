@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOKK 회수 창구 v1.2 (v3.8.0-b1)</title>
+<style>
+ :root { font-family: system-ui, sans-serif; }
+ body { margin: 0; padding: 12px; background: #0e1116; color: #dde3ec; }
+ h1 { font-size: 1.1rem; margin: 4px 0 10px; }
+ button { font-size: 1rem; padding: 10px 16px; border-radius: 10px; border: 0; cursor: pointer; }
+ #btnConn { background: #2f6fed; color: #fff; width: 100%; padding: 14px; font-weight: 700; }
+ .row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+ .row button { background: #263041; color: #dde3ec; flex: 1; }
+ .card { background: #171c24; border: 1px solid #2a3342; border-radius: 12px; padding: 10px 12px; margin-top: 10px; }
+ .k { color: #8b96a8; font-size: .8rem; }
+ .v { font-size: 1.05rem; font-weight: 700; }
+ #warn { display:none; background:#3a2a12; border:1px solid #7a5a20; color:#ffcc66; border-radius:10px; padding:8px 10px; margin-top:8px; font-size:.85rem; }
+ #log { font-family: ui-monospace, monospace; font-size: .72rem; white-space: pre-wrap; word-break: break-all;
+        max-height: 38vh; overflow-y: auto; background: #0a0d12; border-radius: 8px; padding: 8px; margin-top: 8px; }
+ .ok { color: #6fdc8c; } .warnc { color: #ffcc66; } .err { color: #ff7b72; }
+ .step { color: #8b96a8; font-size: .8rem; margin-top: 6px; }
+ .step b.on { color: #6fdc8c; }
+</style>
+</head>
+<body>
+<h1>NOKK 회수 창구 <span class="k">v1.2 · ★발동층 + 니어미스층 자동 회수 · 서버리스(전 처리 = 이 브라우저 안)</span></h1>
+<button id="btnConn">① 연결 (유일한 수동 단계)</button>
+<div class="step">자동: <b id="s2">② 시각 주입</b> → <b id="s3">③ 백로그 수신</b> → <b id="s4">④ 재조립·중복 제거</b> → <b id="s5">⑤ ack 회신</b></div>
+<div id="warn"></div>
+<div class="card">
+ <div class="row" style="margin-top:0">
+  <div style="flex:1"><div class="k">상태</div><div class="v" id="st">대기</div></div>
+  <div style="flex:1"><div class="k">수신 조각</div><div class="v" id="nChunk">0</div></div>
+  <div style="flex:1"><div class="k">완전 줄(신규/총)</div><div class="v" id="nLine">0/0</div></div>
+  <div style="flex:1"><div class="k">니어미스(신규/총)</div><div class="v" id="nNm">0/0</div></div>
+  <div style="flex:1"><div class="k">기간</div><div class="v" id="span">—</div></div>
+ </div>
+ <div class="row">
+  <button id="btnCopy">전체 복사 (정제 포맷)</button>
+  <button id="btnVib">진동 이력</button>
+  <button id="btnExp">파일 내보내기</button>
+  <button id="btnClr">저장 비우기</button>
+ </div>
+</div>
+<div id="log"></div>
+<div class="k" style="margin-top:8px">
+ Android Chrome/Edge 전용(iOS ✕ — 정식 앱에서 해소) · <b>회수(BLE 연결)는 HTTPS 주소에서만 가능</b> —
+ 이 파일을 내려받아 file:// 로 열면 <b>저장분 조회·복사·내보내기 전용</b>(연결 불가). 오프라인 캐시(Service Worker)는 ★미구현.
+ 브라우저 저장소(localStorage) 누적 — 용량 기기 의존 [?] · 정본 = 본체 내부 원장(이 페이지는 사본+도장).
+</div>
+<script>
+'use strict';
+const SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+      TXC='6e400003-b5a3-f393-e0a9-e50e24dcca9e',
+      RXC='6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const $=id=>document.getElementById(id);
+const log=(m,c)=>{const d=$('log');d.innerHTML+=(c?`<span class="${c}">${m}</span>`:m)+'\n';d.scrollTop=d.scrollHeight;};
+const LS='nokk_lines_v1', LSN='nokk_nm_v1';
+let rx=null, buf='', chunks=0, newLines=0, ackTimer=null;
+/* ★I-278 §1-b — 니어미스층: id 키 저장·최후 연속 id ack */
+let nmStore={}, nmSeen=new Set(), nmMin=null, nmMax=null, newNm=0;
+
+/* ── 상태: 저장 캐시는 메모리에 유지(O(1) 경로) ───────────────────── */
+let store = {};            // key "boot:seq:ms" -> line
+let anchors = {};          // boot -> {abs, ms}   ★TIME 줄 수신 시 1회만 갱신
+let seqSeen = new Set();   // 이번 연결에서 받은 seq (연속성 판정용)
+let seqMin = null, seqMax = null;
+let quotaHit = false;
+
+function loadStore(){
+  try { store = JSON.parse(localStorage.getItem(LS)||'{}'); } catch(e){ store={}; }
+  try { nmStore = JSON.parse(localStorage.getItem(LSN)||'{}'); } catch(e){ nmStore={}; }
+  anchors = {};
+  for(const k in store) learnAnchor(store[k]);     // 최초 1회만 전체 순회
+}
+function persist(){
+  if(quotaHit) return;
+  try { localStorage.setItem(LS, JSON.stringify(store)); localStorage.setItem(LSN, JSON.stringify(nmStore)); }
+  catch(e){
+    quotaHit = true;
+    showWarn('저장소가 가득 찼습니다 — 수신은 계속됩니다(메모리 보관). [파일 내보내기] 후 [저장 비우기] 하세요.');
+    log('localStorage 초과: '+e.name+' — 메모리 모드로 계속','warnc');
+  }
+}
+function showWarn(msg){ const w=$('warn'); w.style.display='block'; w.textContent='⚠ '+msg; }
+function learnAnchor(line){
+  const m=line.match(/^L\|\d+\|B(\d+)\|(\d+)\|TIME\|abs=(\d+)\|millis=(\d+)/);
+  if(m) anchors[m[1]]={abs:Number(m[3]), ms:Number(m[4])};
+}
+function absOf(line){
+  const m=line.match(/^L\|\d+\|B(\d+)\|(\d+)\|/); if(!m) return null;
+  const a=anchors[m[1]]; if(!a) return null;
+  return a.abs + (Number(m[2]) - a.ms);
+}
+const fmt=t=>{const d=new Date(t);return `${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${d.toTimeString().slice(0,8)}`;};
+
+/* ── ③④ 수신: O(1) — 파싱·저장·카운터만 ─────────────────────────── */
+function onChunk(ev){
+  const v=new TextDecoder().decode(ev.target.value);
+  chunks++; $('nChunk').textContent=chunks;
+  buf+=v;
+  let i, dirty=false;
+  while((i=buf.indexOf('\n'))>=0){
+    const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
+    /* ★I-278 §1-b / I-279 F2 — 니어미스 줄: N|<id>|<boot>|<peakMs>|<b64 560B>
+     *   (원장 줄과 별도 저장·별도 커서 · 절대시각 = ★해당 boot 의 TIME 앵커로만 환산) */
+    if(line.startsWith('N|')){
+      /* ★I-279 F2 — N|<id>|<boot>|<peakMs>|<b64> */
+      const nm=line.match(/^N\|(\d+)\|(\d+)\|(\d+)\|(\S+)$/); if(!nm) continue;
+      const id=Number(nm[1]);
+      nmSeen.add(id);
+      if(nmMin===null||id<nmMin) nmMin=id;
+      if(nmMax===null||id>nmMax) nmMax=id;
+      if(!(id in nmStore)){ nmStore[id]=line; newNm++; dirty=true; }
+      continue;
+    }
+    if(!line.startsWith('L|')) continue;
+    const m=line.match(/^L\|(\d+)\|B(\d+)\|(\d+)\|/); if(!m) continue;
+    const sq=Number(m[1]);
+    const key=`${m[2]}:${m[1]}:${m[3]}`;
+    seqSeen.add(sq);
+    if(seqMin===null||sq<seqMin) seqMin=sq;
+    if(seqMax===null||sq>seqMax) seqMax=sq;
+    if(!(key in store)){ store[key]=line; learnAnchor(line); dirty=true; newLines++; }
+  }
+  if(dirty){
+    persist();
+    $('nLine').textContent=`${newLines}/${Object.keys(store).length}`;
+    $('nNm').textContent=`${newNm}/${Object.keys(nmStore).length}`;
+  }
+  clearTimeout(ackTimer);
+  ackTimer=setTimeout(finish, 3000);              // 3s 정적 = 배치 완료 추정
+}
+
+/* ── ⑤ ack = ★최후 연속 seq (이번 연결 첫 seq부터 빠짐없이) ───────── */
+function contiguous(seen, min, max){          /* ★공용 — 원장 seq·니어미스 id 동일 알고리즘 */
+  if(min===null) return {ack:0, missing:0};
+  let s=min;
+  while(seen.has(s+1)) s++;
+  let missing=0;
+  for(let k=s+1;k<=max;k++) if(!seen.has(k)) missing++;
+  return {ack:s, missing};
+}
+const contiguousAck = () => contiguous(seqSeen, seqMin, seqMax);
+/* ★I-279 F1 — 원장·니어미스 도장 ★완전 독립: 한쪽 부재·실패가 다른 쪽을 막지 않는다.
+ *   (구판은 원장 ack=0 시 조기 귀환 → "nm 백로그만 흐르는 재개 연결"에서 커서 영구 정지·무한 재송신) */
+async function finish(){
+  computeStats();                                 // 기간·정렬·통계 = ★여기서 1회만
+  if(!rx) return;
+  let done=0;
+  const led=contiguousAck();                      // ── 원장 도장(독립)
+  if(led.ack){
+    if(led.missing>0){
+      showWarn(`유실 의심 ${led.missing}건 — 연속 구간(≤${led.ack})까지만 도장합니다. 다음 연결에서 재수신됩니다.`);
+      log(`⑤ 원장 불연속: 수신 ${seqMin}~${seqMax} 중 빠짐 ${led.missing}건 → ack 보류선 = ${led.ack}`,'warnc');
+    }
+    try{
+      await rx.writeValue(new TextEncoder().encode(`ack ${led.ack}`));
+      log(`⑤ ack ${led.ack} 회신 (최후 연속 seq · 본체 원장은 잔존·도장만)`,'ok'); done++;
+    }catch(e){ log('원장 ack 실패: '+e.message,'err'); }
+  } else log('⑤ 원장 신규 0줄 — ack 생략(정상)');
+  const nm=contiguous(nmSeen, nmMin, nmMax);      // ── 니어미스 도장(독립 · 원장 결과 무관)
+  if(nm.ack){
+    if(nm.missing>0) log(`⑤ 니어미스 불연속 ${nm.missing}건 → ack n 보류선 = ${nm.ack}`,'warnc');
+    try{
+      await rx.writeValue(new TextEncoder().encode(`ack n${nm.ack}`));
+      log(`⑤ ack n${nm.ack} 회신 (니어미스 최후 연속 id)`,'ok'); done++;
+    }catch(e){ log('니어미스 ack 실패: '+e.message,'err'); }
+  } else log('⑤ 니어미스 신규 0건 — ack n 생략(정상)');
+  try{
+    $('s5').classList.add('on');
+    const part=(led.missing>0)||(nm.missing>0);
+    $('st').textContent = done===0 ? '수신 없음·대기' : (part ? '회수 완료(부분 도장)' : '회수 완료·대기');
+  }catch(e){ log('상태 갱신 실패: '+e.message,'err'); }
+}
+function computeStats(){
+  const keys=Object.keys(store);
+  $('nLine').textContent=`${newLines}/${keys.length}`;
+  $('nNm').textContent=`${newNm}/${Object.keys(nmStore).length}`;
+  let lo=null,hi=null;
+  for(const k of keys){ const t=absOf(store[k]); if(t){ if(!lo||t<lo)lo=t; if(!hi||t>hi)hi=t; } }
+  $('span').textContent=(lo&&hi)?`${fmt(lo)}~${fmt(hi)}`:'(TIME 앵커 대기)';
+}
+
+$('btnConn').onclick=async()=>{
+  if(!navigator.bluetooth){ showWarn('이 브라우저/주소에서는 BLE 연결이 불가합니다 (HTTPS + Android Chrome/Edge 필요).'); return; }
+  try{
+    $('st').textContent='검색…';
+    const dev=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'NOKK'}],optionalServices:[SVC]});
+    dev.addEventListener('gattserverdisconnected',()=>{ $('st').textContent='끊김(재연결 = ① 다시)'; log('연결 해제','warnc'); });
+    const gatt=await dev.gatt.connect();
+    const svc=await gatt.getPrimaryService(SVC);
+    const tx=await svc.getCharacteristic(TXC);
+    rx=await svc.getCharacteristic(RXC);
+    seqSeen=new Set(); seqMin=seqMax=null; newLines=0; buf='';
+    nmSeen=new Set(); nmMin=nmMax=null; newNm=0;      /* ★I-278 — 연결 단위 연속성 판정 */
+    await tx.startNotifications();
+    tx.addEventListener('characteristicvaluechanged', onChunk);
+    $('st').textContent='연결·구독 ✓'; $('btnConn').textContent='연결됨: '+dev.name;
+    await rx.writeValue(new TextEncoder().encode('time '+Date.now()));   // ② 자동 시각 주입
+    $('s2').classList.add('on'); $('s3').classList.add('on'); $('s4').classList.add('on');
+    log('② time 주입 → ③ 백로그 수신 개시','ok');
+  }catch(e){ $('st').textContent='실패'; log('연결 실패: '+e.message,'err'); }
+};
+function refined(){
+  return Object.entries(store).map(([k,l])=>{
+    const m=l.match(/^L\|(\d+)\|B(\d+)\|/);
+    return {b:Number(m[2]), s:Number(m[1]), t:absOf(l), l};
+  }).sort((a,b)=>a.b-b.b||a.s-b.s)
+    .map(r=>`${r.t?('['+fmt(r.t)+'] '):'[시각미상] '}${r.l}`).join('\n');
+}
+$('btnCopy').onclick=async()=>{ await navigator.clipboard.writeText(refined()); log('복사 완료 — 완전 줄·중복 제거·절대시각·순번 정렬','ok'); };
+$('btnVib').onclick=()=>{
+  let n=0; log('--- 진동 이력 (VIB|·발동 태그) ---');
+  for(const k in store) if(/\|VIB\||>>>/.test(store[k])){ const t=absOf(store[k]); log(`${t?fmt(t):'?'} ${store[k].slice(0,110)}`); n++; }
+  log(`--- ${n}건 ---`);
+};
+$('btnExp').onclick=()=>{
+  const name=`nokk_${new Date().toISOString().slice(0,16).replace(/[:T]/g,'')}.txt`;
+  /* ★I-278 §1-b·d — 원장 + 니어미스 구분 표기(니어미스 ms → 동일 부팅 앵커로 절대시각 환산 시도) */
+  const nmIds=Object.keys(nmStore).map(Number).sort((a,b)=>a-b);
+  /* ★I-279 F2 — ★해당 boot 의 TIME 앵커로만 환산(단일 부팅 가정 제거 · 앵커 없으면 [시각미상] 정직 표기) */
+  const nmTxt=nmIds.map(id=>{
+    const m=nmStore[id].match(/^N\|\d+\|(\d+)\|(\d+)\|/);
+    let abs=null;
+    if(m){ const a=anchors[m[1]]; if(a) abs=a.abs+(Number(m[2])-a.ms); }
+    return `${abs?('['+fmt(abs)+'] '):'[시각미상] '}${nmStore[id]}`;
+  }).join('\n');
+  const body=`### 발동층(원장)\n${refined()}\n\n### 니어미스층(${nmIds.length}건 · b64 560B 레코드)\n${nmTxt}\n`;
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([body],{type:'text/plain'}));
+  a.download=name; a.click();
+  log(`저장: ${name} (원장 ${Object.keys(store).length}줄 + 니어미스 ${nmIds.length}건)`,'ok');
+};
+$('btnClr').onclick=()=>{
+  if(confirm('브라우저 저장분을 비웁니까? (본체 원장은 무관 — 내보내기 먼저 권장)')){
+    localStorage.removeItem(LS); localStorage.removeItem(LSN);
+    store={}; nmStore={}; anchors={}; newLines=0; newNm=0; quotaHit=false;
+    $('warn').style.display='none'; computeStats(); log('저장 비움','warnc');
+  }
+};
+loadStore(); computeStats();
+</script>
+</body>
+</html>
