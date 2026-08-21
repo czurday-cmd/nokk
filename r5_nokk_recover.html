@@ -215,10 +215,17 @@ $('btnConn').onclick=async()=>{
  *   ⓑ 결번 = ★부팅(B값)별로 계산 — 부팅 경계 간극(F9 NVS 마진 +50)은 설계분이라 제외하고
  *      "부팅 n회 전환"으로 별도 표기.
  *   ⓒ 빈 저장소면 간극 계산 자체를 생략(구판은 "결번 1건" 오표기). */
+/* ★I-288 F3″ — "기기 최신"은 ★HB5 lseq 만으로 판단하고, ack·seqMax 로 ★채우지 않는다.
+ *   F3′ 기각 근거: HB5 의 lseq 는 ★자기 줄의 seq 다(실측 `L|1928|…lseq=1928`).
+ *   따라서 수신한 HB5 의 lseq 최대 ≤ 수신 max ≤ ack 가 항상 성립 → max() 를 쓰면 미회수가
+ *   ★구조적으로 항상 0 이 되어 지표가 죽는다.
+ *   ★현 판에서 기기 최신을 알 방법은 없다(END 마커 미구현 — 내일 1순위 이월).
+ *   → HB5 lseq > ack 인 경우에만 실제 차이를 표기하고, 그 외에는 ★"미상"으로 정직하게 둔다.
+ *   ★배치 온전성 판단은 위의 ★결번 항으로 한다. */
 function devLatestSeq(){
   let mx=0;
   for(const k in store){ const m=store[k].match(/lseq=(\d+)/); if(m){ const v=Number(m[1]); if(v>mx) mx=v; } }
-  return mx;
+  return mx;                       /* ack·seqMax 로 보정하지 않는다(F3′ 오류) */
 }
 function header(rows){
   const now=fmt(Date.now());
@@ -241,11 +248,14 @@ function header(rows){
     }
   }
   const ackV=lastAck||0, devV=devLatestSeq();       /* ⓐ */
-  const un = devV ? Math.max(0, devV-ackV) : null;
+  /* ★F3″ — HB5 lseq 가 ack 를 넘는 경우에만 실 미회수. 그 외 = 판단 불가(END 마커 미구현) */
+  const tail = (devV > ackV)
+    ? `# 기기 잔량: ack ${ackV} / 기기 최신 ${devV} = ★미회수 ${devV-ackV}줄\n`
+    : `# 기기 잔량: ack ${ackV} / 기기 최신 ★미상(END 마커 미구현) · ★배치 온전성 판단 = 위 결번 항\n`;
   return `# NOKK 회수 ${now}\n`
        + `# 구간: ${lo} ~ ${hi} (시각확정 ${okT.length}줄 / 미상 ${noT}줄)\n`
        + `# 수신: ${rows.length}줄 · seq ${mn}~${mx} · ★결번 ${nGap}건 [${gaps.slice(0,5).join(', ')||'없음'}] · 부팅 ${boots}회 전환\n`
-       + `# 기기 잔량: ack ${ackV} / 기기 최신 ${devV||'미상'} = ★미회수 ${un===null?'미상':un+'줄'}\n`;
+       + tail;
 }
 function refined(){
   const rows=Object.entries(store).map(([k,l])=>{
