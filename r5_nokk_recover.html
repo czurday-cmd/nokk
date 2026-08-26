@@ -3,7 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NOKK 회수 창구 v1.3 (v3.8.0-b2)</title>
+<title>NOKK 회수 창구 v1.4 (2026-08-26 · v3.8.6-b1)</title>
+<!-- ★판 식별: v1.4 · 2026-08-26 · 대응 펌웨어 v3.8.6-b1.
+     이번 판 변경: ①원장 연속-ack(설계갭 스킵) ②nm 연속-ack(nmContigAck·NBEGIN evict floor) ③END/GAP 파싱·자동끊김
+     ④defer-persist ⑤범위표시 ⑥저장% → "미회수(안 받은) 건수"로 재설계(부팅리셋 held 폐기·html만·재플래시 불요). -->
 <style>
  :root { font-family: system-ui, sans-serif; }
  body { margin: 0; padding: 12px; background: #0e1116; color: #dde3ec; }
@@ -24,7 +27,7 @@
 </style>
 </head>
 <body>
-<h1>NOKK 회수 창구 <span class="k">v1.3 · v3.8.0-b2 · ★발동층 + 니어미스층 자동 회수 · 서버리스(전 처리 = 이 브라우저 안)</span></h1>
+<h1>NOKK 회수 창구 <span class="k">v1.4 · 2026-08-26 · v3.8.6-b1 · ★발동층 + 니어미스층 자동 회수 · 서버리스(전 처리 = 이 브라우저 안)</span></h1>
 <button id="btnConn">① 연결 (유일한 수동 단계)</button>
 <div class="step">자동: <b id="s2">② 시각 주입</b> → <b id="s3">③ 백로그 수신</b> → <b id="s4">④ 재조립·중복 제거</b> → <b id="s5">⑤ ack 회신</b></div>
 <div id="warn"></div>
@@ -34,6 +37,7 @@
   <div style="flex:1"><div class="k">수신 조각</div><div class="v" id="nChunk">0</div></div>
   <div style="flex:1"><div class="k">완전 줄(신규/총)</div><div class="v" id="nLine">0/0</div></div>
   <div style="flex:1"><div class="k">니어미스(신규/총)</div><div class="v" id="nNm">0/0</div></div>
+  <div style="flex:1"><div class="k">본체 미회수(안 받은)</div><div class="v" id="devStore">—</div></div>
   <div style="flex:1"><div class="k">기간</div><div class="v" id="span">—</div></div>
  </div>
  <div class="row">
@@ -58,8 +62,16 @@ const $=id=>document.getElementById(id);
 const log=(m,c)=>{const d=$('log');d.innerHTML+=(c?`<span class="${c}">${m}</span>`:m)+'\n';d.scrollTop=d.scrollHeight;};
 const LS='nokk_lines_v1', LSN='nokk_nm_v1';
 let rx=null, buf='', chunks=0, newLines=0, ackTimer=null;
+/* ★★v3.8.3-b2 로그전송 — C(연속-ack) + END + defer-persist 상태 */
+let gapRanges=[];              /* 설계갭 [lo,hi] 배열 (부팅 마진 GAP|boot + 조각삭제 GAP|frag) — 연속-ack 스킵용 */
+let endSeq=null;               /* END|<seq> 배치 완료 지점(있으면 즉시 완료) */
+let dirtyPending=false;        /* defer-persist: 배치끝(finish)에 1회 localStorage 기록 */
+let gDev=null;                 /* ★END 자동끊김용 기기 핸들 */
 /* ★I-278 §1-b — 니어미스층: id 키 저장·최후 연속 id ack */
 let nmStore={}, nmSeen=new Set(), nmMin=null, nmMax=null, newNm=0;
+let nmFloor=null;              /* ★§1-1 — NBEGIN|<floor>: 본체 링 evict 바닥. 이 미만 id = ★설계소실(evict)·전송손실 아님.
+                                 nm id 는 부팅마진 없이 연속(getUInt("id") 정확복원) → 수신범위 내부 구멍 = 전송손실뿐. */
+let nmDevCount=null, nmDevLost=null, nmDevTotal=816;   /* ★§1-3 — 본체 nm 저장 상태(NBEGIN 동봉: 누적/유실/용량816) */
 let lastAck=0, lastDevSeq=0;   /* ★I-286 F3 — 머리글 '기기 잔량'용(마지막 ack·수신 최대 seq) */
 
 /* ── 상태: 저장 캐시는 메모리에 유지(O(1) 경로) ───────────────────── */
@@ -104,8 +116,25 @@ function onChunk(ev){
   let i, dirty=false;
   while((i=buf.indexOf('\n'))>=0){
     const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
-    /* ★I-278 §1-b / I-279 F2 — 니어미스 줄: N|<id>|<boot>|<peakMs>|<b64 560B>
+    /* ★★★v3.8.3-b2 로그전송 — END 마커: 배치 완료 통지(본체 ble_link END|<seq>). 3s 추정 대신 즉시 완료. */
+    if(line.startsWith('END|')){
+      const em=line.match(/^END\|(\d+)/); if(em) endSeq=Number(em[1]);
+      clearTimeout(ackTimer); finish(true); continue;
+    }
+    /* ★I-278 §1-b / I-279 F2 · ★v3.8.3-b2 2단계 — 니어미스 줄: N|<id>|<boot>|<peakMs>|<b64 580B>
+     *   ★형식 v2 = 슬롯 33B(구 24B)·레코드 580B(구 560B)·rec[14]=버전·rec[15]=슬롯stride·slots@[17].
+     *   ★3단계 rec[16]=meta = kind(b7: 0 니어미스/1 발동벡터) + reason/축(b0-6). BLE 줄 형식 불변(b64에 내포).
+     *   본 페이지는 b64 원문 그대로 저장/내보내기(크기 무관) — PC 디코더가 rec[14]=버전·rec[16]=종류로 분리.
      *   (원장 줄과 별도 저장·별도 커서 · 절대시각 = ★해당 boot 의 TIME 앵커로만 환산) */
+    /* ★★★§1-1 evict-마킹 수신 — NBEGIN|<floor>: nm 배치 첫 줄. floor 미만 id 는 링 회전으로 소거(설계소실).
+     *   이 값으로 아래 nmContigAck 가 floor 미만을 스킵하고 floor 이상 진짜 결번(전송손실)에서만 멈춤. */
+    if(line.startsWith('NBEGIN|')){
+      /* NBEGIN|<floor>[|<count누적>|<lost유실>|<total용량>] — 뒤 3필드는 §1-3 저장% (구펌웨어엔 없을 수 있음) */
+      const nb=line.match(/^NBEGIN\|(\d+)(?:\|(\d+)\|(\d+)\|(\d+))?/);
+      if(nb){ nmFloor=Number(nb[1]);
+        if(nb[2]!==undefined){ nmDevCount=Number(nb[2]); nmDevLost=Number(nb[3]); nmDevTotal=Number(nb[4])||816; updateDevStore(); } }
+      continue;
+    }
     if(line.startsWith('N|')){
       /* ★I-279 F2 — N|<id>|<boot>|<peakMs>|<b64> */
       const nm=line.match(/^N\|(\d+)\|(\d+)\|(\d+)\|(\S+)$/); if(!nm) continue;
@@ -120,18 +149,24 @@ function onChunk(ev){
     const m=line.match(/^L\|(\d+)\|B(\d+)\|(\d+)\|/); if(!m) continue;
     const sq=Number(m[1]);
     const key=`${m[2]}:${m[1]}:${m[3]}`;
+    /* ★★★v3.8.3-b2 로그전송 C — 설계갭 마커(부팅 마진 GAP|boot + 조각 삭제 GAP|frag)를 gapRanges 에 적재.
+     *   연속-ack 가 이 구간을 '설계상 부재'로 스킵 → 전송손실(미마킹)만 재전송·고착 없음. */
+    const gmk=line.match(/\|GAP\|(?:frag|boot)=(\d+)~(\d+)/);
+    if(gmk){ gapRanges.push([Number(gmk[1]),Number(gmk[2])]); }
     seqSeen.add(sq);
     if(seqMin===null||sq<seqMin) seqMin=sq;
     if(seqMax===null||sq>seqMax) seqMax=sq;
     if(!(key in store)){ store[key]=line; learnAnchor(line); dirty=true; newLines++; }
   }
+  /* ★★v3.8.3-b2 로그전송 defer-persist — localStorage 를 청크마다(스로틀·드롭 원인) 대신 배치끝(finish)에 1회.
+   *   수신 중엔 메모리(store)만·화면 카운터만 갱신 → onChunk O(1) → 폰 수신속도 회복(드롭↓). */
   if(dirty){
-    persist();
+    dirtyPending=true;
     $('nLine').textContent=`${newLines}/${Object.keys(store).length}`;
     $('nNm').textContent=`${newNm}/${Object.keys(nmStore).length}`;
   }
   clearTimeout(ackTimer);
-  ackTimer=setTimeout(finish, 3000);              // 3s 정적 = 배치 완료 추정
+  ackTimer=setTimeout(()=>finish(false), 3000);   // ★END 못 받으면 3s 폴백(끊김 등)
 }
 
 /* ── ⑤ ack = ★최후 연속 seq (이번 연결 첫 seq부터 빠짐없이) ───────── */
@@ -143,41 +178,96 @@ function onChunk(ev){
  *        8/21 실측: 843~1900 중 671개가 ★유령 seq → 구 알고리즘이 ack 843 에 영구 고정(무한 재송신).
  *   ★max 채택의 안전성: 도장은 "본체가 조각을 재사용해도 좋다"는 의미이고, 본체는 도장 이하 조각만
  *   재사용한다. 연결 중 수신분은 전부 도착했으므로 max 까지 도장해도 미수신 줄을 지우지 않는다. */
-function ackPoint(seen, min, max){
-  if(min===null) return {ack:0, gaps:0};
-  let gaps=0;
-  for(let k=min;k<=max;k++) if(!seen.has(k)) gaps++;
-  return {ack:max, gaps};                     /* ★max 도장 · gaps = 정보용(설계 간극 포함) */
+/* ★★★v3.8.3-b2 로그전송 C — ★연속-ack(갭 스킵)으로 교체. 구 max-ack 는 미수신 seq 를 넘어 도장 →
+ *   커서가 드롭분을 지나쳐 ★영구 손실(33% 재발 근인). 신 규약: [min,S] 가 모두 수신 ∨ 설계갭(isGap)인
+ *   최대 S 를 도장. 전송손실(미마킹)에서 멈춰 다음 연결 재전송(무손실). 설계갭(GAP|boot+GAP|frag·마킹됨)은
+ *   스킵해 8/21 843-고착 회피. ★B(부팅갭 마킹)가 있어야 성립 — B 없이는 부팅 전환마다 고착. */
+function ackPoint(seen, min, max, isGap){
+  if(min===null) return {ack:0, gaps:0, missing:0};
+  let s=min-1, missing=0;
+  for(let k=min;k<=max;k++){
+    if(seen.has(k) || (isGap&&isGap(k))) s=k;   // 수신 or 설계갭 → 연속 전진
+    else break;                                  // 전송손실 → 여기서 멈춤(다음 연결 재전송)
+  }
+  for(let k=(s<min?min:s+1);k<=max;k++) if(!seen.has(k) && !(isGap&&isGap(k))) missing++;
+  return {ack:(s>=min?s:0), gaps:missing, missing};
 }
-const contiguousAck = () => ackPoint(seqSeen, seqMin, seqMax);
+const inGap=(k)=>{ for(const g of gapRanges) if(k>=g[0]&&k<=g[1]) return true; return false; };
+const contiguousAck = () => ackPoint(seqSeen, seqMin, seqMax, inGap);
+/* ★★★§1-1 nm 연속-ack(evict 마킹 완료 → 원장 C 와 동형) — 구 nmMaxAck(max) 폐기.
+ *   구 max-ack 결함: 배치 중간 id 가 전송손실되면 max 까지 도장 → 커서가 손실분을 넘어 ★영구 손실
+ *   (원장 33% 재발 근인과 동일 부류를 nm 에도 방치했던 지점).
+ *   ★base = nmMin(=본체 resume 지점 = nmack+1) — 원장 seqMin 과 동형. floor 를 base 로 쓰면 후속 연결
+ *   (본체 커서>floor)에서 리더는 커서 이후만 받는데 floor 부터 스캔 → 즉시 결번 → ack 0 고착(오류)이라 금지.
+ *   nm id 는 부팅마진 없이 연속·evict 는 바닥(≤floor≤min)만 제거 → [min,max] 내부 구멍 = 전송손실뿐 →
+ *   [min..S] 모두 수신인 최대 S 도장, 첫 결번서 정지 → 다음 연결 재전송(무손실).
+ *   isEv 는 안전망: 이례적으로 min<floor 면 floor 미만(evict)을 설계공백으로 스킵(정상경로선 min≥floor 라 미발동). */
+function nmContigAck(seen, floor, min, max){
+  if(min===null) return {ack:0, gaps:0, missing:0};
+  const isEv=(k)=> (floor!==null && floor>0 && k<floor);
+  let s=min-1, missing=0;
+  for(let k=min;k<=max;k++){ if(seen.has(k)||isEv(k)) s=k; else break; }   /* 수신/설계공백 연속 전진·전송손실서 정지 */
+  for(let k=s+1;k<=max;k++) if(!seen.has(k)&&!isEv(k)) missing++;           /* 도장 이후 미수신(전송손실) 계수 */
+  return {ack:(s>=min?s:0), gaps:missing, missing};
+}
 /* ★I-279 F1 — 원장·니어미스 도장 ★완전 독립: 한쪽 부재·실패가 다른 쪽을 막지 않는다.
  *   (구판은 원장 ack=0 시 조기 귀환 → "nm 백로그만 흐르는 재개 연결"에서 커서 영구 정지·무한 재송신) */
-async function finish(){
+let finishing=false;
+async function finish(viaEnd){
+  if(finishing) return; finishing=true;             /* 재진입 방지(END + 3s 폴백 동시) */
+  try{
+  if(dirtyPending){ persist(); dirtyPending=false; } /* ★defer-persist: 배치끝 1회 localStorage 기록 */
   computeStats();                                 // 기간·정렬·통계 = ★여기서 1회만
-  if(!rx) return;
+  if(!rx){ finishing=false; return; }
   let done=0;
-  const led=contiguousAck();                      // ── 원장 도장(독립)
+  const led=contiguousAck();                      // ── 원장 도장(★연속-ack·설계갭 스킵)
   if(led.ack){
-    if(led.gaps>0)                                /* ★I-285 §1-c — 경고 폐기 → 정보 로그 격하 */
-      log(`⑤ 원장 간극 ${led.gaps}건 (수신 ${seqMin}~${seqMax} · ★설계 간극[부팅 마진·조각 GAP] 포함 — 유실 아님)`);
+    if(led.missing>0)                             /* ★missing = 전송손실(미마킹)만 — 다음 연결서 자동 재수신 */
+      log(`⑤ 원장 미수신 ${led.missing}건 (전송손실 → ★다음 연결서 커서 ${led.ack} 이후 재전송·유실 아님)`,'warnc');
     try{
       await rx.writeValue(new TextEncoder().encode(`ack ${led.ack}`));
       lastAck=led.ack; lastDevSeq=seqMax||lastDevSeq;   /* ★F3 */
-      log(`⑤ ack ${led.ack} 회신 (수신 max seq · 본체 원장은 잔존·도장만)`,'ok'); done++;
+      log(`⑤ ack ${led.ack} 회신 (★연속-ack: ${led.ack}까지 빠짐없이 수신 확정·본체 잔존)`,'ok'); done++;
     }catch(e){ log('원장 ack 실패: '+e.message,'err'); }
   } else log('⑤ 원장 신규 0줄 — ack 생략(정상)');
-  const nm=ackPoint(nmSeen, nmMin, nmMax);        // ── 니어미스 도장(독립 · 원장 결과 무관)
+  const nm=nmContigAck(nmSeen, nmFloor, nmMin, nmMax);   // ── ★§1-1 니어미스 도장(연속-ack·evict floor 스킵)
   if(nm.ack){
-    if(nm.gaps>0) log(`⑤ 니어미스 간극 ${nm.gaps}건 (★조각 순환 설계 간극 포함 — 유실 아님)`);
+    if(nm.missing>0)                                     /* ★전송손실(floor 이상 결번)만 — 다음 연결서 재수신 */
+      log(`⑤ 니어미스 미수신 ${nm.missing}건 (전송손실 → ★다음 연결서 id ${nm.ack} 이후 재전송·유실 아님)`,'warnc');
     try{
       await rx.writeValue(new TextEncoder().encode(`ack n${nm.ack}`));
-      log(`⑤ ack n${nm.ack} 회신 (수신 max id)`,'ok'); done++;
+      log(`⑤ ack n${nm.ack} 회신 (★연속-ack: floor${nmFloor!==null?` ${nmFloor}`:''}~${nm.ack} 빠짐없이 수신 확정)`,'ok'); done++;
     }catch(e){ log('니어미스 ack 실패: '+e.message,'err'); }
   } else log('⑤ 니어미스 신규 0건 — ack n 생략(정상)');
+  updateDevStore();                                /* ★§1-3 재설계 — 배치 완료 후 미회수(안 받은) 건수 갱신 */
+  /* ★★범위 표시 — 이번에 받은 seq 범위 + 미수신(재전송 대기) */
+  if(seqMin!==null) log(`■ 이번 수신 원장 seq ${seqMin}~${seqMax}${led.missing>0?` · 미수신 ${led.missing}건(다음 연결 재수신)`:' · ★결번 0(연속)'}`,led.missing>0?'warnc':'ok');
   try{
     $('s5').classList.add('on');
-    $('st').textContent = done===0 ? '수신 없음·대기' : '회수 완료·대기';
+    $('st').textContent = done===0 ? '수신 없음·대기' : (viaEnd? '회수 완료(END)·대기' : '회수 완료·대기');
   }catch(e){ log('상태 갱신 실패: '+e.message,'err'); }
+  /* ★★END(완료) → 연결 자동 종료. 복사 버튼은 끊긴 뒤에도 store 로 동작(유지). */
+  if(viaEnd && gDev && gDev.gatt && gDev.gatt.connected){
+    try{ gDev.gatt.disconnect(); log('END 수신 — 배치 완료·연결 자동 종료(복사 가능)','ok'); }catch(e){}
+  }
+  } finally { finishing=false; }
+}
+/* ★★§1-3 재설계(2026-08-26·html만·재플래시 불요) — 구 "held=count−lost ÷ 816" 폐기.
+ *   폐기 근거(세션 코드확인): 펌웨어 count/lost 는 ★부팅마다 0 리셋(bvec.cpp:20·복원 없음) → 부팅 직후 실제 꽉 참인데도 0%.
+ *   ★신 정의 = "미회수(안 받은) 건수" = 본체 보유 범위[nmFloor..hi] 중 폰 nmStore(localStorage 영속)에 ★없는 id 수.
+ *   재료 전부 폰 보유: nmFloor(NBEGIN)·nmMax(수신 최대)·nmStore(id 키 영속) → ★펌웨어 무수정.
+ *   hi = max(nmMax, 폰 보유 최고 id) — nmMax 는 END 완주 시 본체 최신과 일치(중단 시 하한·nmStore 최고로 보정).
+ *   evict분(<nmFloor)은 회수 불가라 제외. ★대상 = nm 링(니어미스/발동벡터)뿐 — 원장(발동기록)은 별도·미포함. */
+function updateDevStore(){
+  const el=$('devStore'); if(!el) return;
+  if(nmFloor===null){ el.textContent='—'; el.className='v'; return; }   /* NBEGIN 미수신(nm 없음/구펌) */
+  let hi = nmFloor-1;
+  if(nmMax!==null && nmMax>hi) hi=nmMax;
+  for(const k in nmStore){ const id=Number(k); if(id>=nmFloor && id>hi) hi=id; }  /* 이전 회수분으로 본체 최신 보정 */
+  let miss=0, avail=0;
+  for(let id=nmFloor; id<=hi; id++){ avail++; if(!(id in nmStore)) miss++; }       /* 본체 보유 중 폰 미보유 = 미회수 */
+  if(miss===0){ el.textContent=`전량 회수 ✓ (본체 ${avail}건)`; el.className='v'; }
+  else        { el.textContent=`미회수 ${miss}건 (본체 ${avail}건·곧 덮임 위험)`; el.className='v warnc'; }
 }
 function computeStats(){
   const keys=Object.keys(store);
@@ -193,6 +283,7 @@ $('btnConn').onclick=async()=>{
   try{
     $('st').textContent='검색…';
     const dev=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'NOKK'}],optionalServices:[SVC]});
+    gDev=dev;                                       /* ★END 자동끊김용 */
     dev.addEventListener('gattserverdisconnected',()=>{ $('st').textContent='끊김(재연결 = ① 다시)'; log('연결 해제','warnc'); });
     const gatt=await dev.gatt.connect();
     const svc=await gatt.getPrimaryService(SVC);
@@ -200,6 +291,7 @@ $('btnConn').onclick=async()=>{
     rx=await svc.getCharacteristic(RXC);
     seqSeen=new Set(); seqMin=seqMax=null; newLines=0; buf='';
     nmSeen=new Set(); nmMin=nmMax=null; newNm=0;      /* ★I-278 — 연결 단위 연속성 판정 */
+    gapRanges=[]; endSeq=null; nmFloor=null;          /* ★C/§1-1 — 연결 단위 설계갭·완료·evict바닥 초기화(직전 배치 잔존 방지) */
     await tx.startNotifications();
     tx.addEventListener('characteristicvaluechanged', onChunk);
     $('st').textContent='연결·구독 ✓'; $('btnConn').textContent='연결됨: '+dev.name;
@@ -281,7 +373,7 @@ $('btnExp').onclick=()=>{
     if(m){ const a=anchors[m[1]]; if(a) abs=a.abs+(Number(m[2])-a.ms); }
     return `${abs?('['+fmt(abs)+'] '):'[시각미상] '}${nmStore[id]}`;
   }).join('\n');
-  const body=`### 발동층(원장)\n${refined()}\n\n### 니어미스층(${nmIds.length}건 · b64 560B 레코드)\n${nmTxt}\n`;
+  const body=`### 발동층(원장)\n${refined()}\n\n### 니어미스층(${nmIds.length}건 · b64 580B 레코드·형식v2 33B슬롯)\n${nmTxt}\n`;
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([body],{type:'text/plain'}));
   a.download=name; a.click();
